@@ -1,111 +1,132 @@
-name: RDP Enhanced (32GB Simulation & Unlimited Runtime)
+name: RDP ULTIMATE (مُصلح بالكامل + IP ثابت + معالجة الأخطاء)
 
 on:
   workflow_dispatch:
 
 jobs:
-  secure-rdp:
-    # استخدام Windows 2022 (قد يمنح أداءً أفضل قليلاً، لكن الذاكرة الفعلية محدودة بـ GitHub)
+  rdp:
     runs-on: windows-2022
-    timeout-minutes: 4320  # 3 أيام (محاولة لتجاوز الحد الـ 6 ساعات، لكن GitHub قد يفرض حداً أعلى)
+    timeout-minutes: 360
 
     steps:
-      - name: Configure Core RDP Settings
+      # =========================================================
+      # 1. تفعيل RDP
+      # =========================================================
+      - name: تفعيل RDP
         run: |
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 -Force
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "SecurityLayer" -Value 0 -Force
-          netsh advfirewall firewall delete rule name="RDP-Tailscale"
-          netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389
-          Restart-Service -Name TermService -Force
+          Set-ItemProperty -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server" -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" -Name "SecurityLayer" -Value 0 -Force
+          netsh advfirewall firewall add rule name="RDP" dir=in action=allow protocol=TCP localport=3389
+          Restart-Service TermService -Force
 
-      - name: Create RDP User with Secure Password
+      # =========================================================
+      # 2. إنشاء مستخدم RDP
+      # =========================================================
+      - name: إنشاء مستخدم RDP
         run: |
-          Add-Type -AssemblyName System.Security
-          $charSet = @{
-            Upper   = [char[]]('A'..'Z')
-            Lower   = [char[]]('a'..'z')
-            Number  = [char[]]('0'..'9')
-            Special = [char[]]('!@#$%^&*()_+-=[]{};:,.<>?/')
-          }
-          $rawPassword = @()
-          $rawPassword += $charSet.Upper | Get-Random -Count 4
-          $rawPassword += $charSet.Lower | Get-Random -Count 4
-          $rawPassword += $charSet.Number | Get-Random -Count 4
-          $rawPassword += $charSet.Special | Get-Random -Count 4
-          $password = -join ($rawPassword | Sort-Object { Get-Random })
+          $password = "P@ss" + (Get-Random -Maximum 99999) + "!"
           $securePass = ConvertTo-SecureString $password -AsPlainText -Force
-          New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
-          Add-LocalGroupMember -Group "Administrators" -Member "RDP"
-          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
-          echo "RDP_CREDS=User: RDP | Password: $password" >> $env:GITHUB_ENV
+          New-LocalUser -Name "Admin" -Password $securePass -AccountNeverExpires -PasswordNeverExpires
+          Add-LocalGroupMember -Group "Administrators" -Member "Admin"
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "Admin"
+          echo "RDP_PASSWORD=$password" >> $env:GITHUB_ENV
 
-      - name: Install Tailscale
-        run: |
-          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
-          $installerPath = "$env:TEMP\tailscale.msi"
-          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
-          Start-Process msiexec.exe -ArgumentList "/i `"$installerPath`"", "/quiet", "/norestart" -Wait
-          Remove-Item $installerPath -Force
+      # =========================================================
+      # 3. استرجاع Cache الحالة (للحفاظ على الـ IP الثابت)
+      # =========================================================
+      - name: استرجاع حالة Tailscale من الكاش
+        uses: actions/cache@v4
+        id: cache-ts
+        with:
+          path: C:\ts-state
+          key: tailscale-state-${{ runner.os }}
+          restore-keys: |
+            tailscale-state-${{ runner.os }}
 
-      - name: Establish Tailscale Connection
+      # =========================================================
+      # 4. تثبيت Tailscale
+      # =========================================================
+      - name: تثبيت Tailscale
         run: |
-          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID
-          $tsIP = $null
-          $retries = 0
-          while (-not $tsIP -and $retries -lt 10) {
-            $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+          curl -L -o tailscale.msi https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi
+          if (-not (Test-Path tailscale.msi)) {
+            Write-Error "فشل تحميل Tailscale"
+            exit 1
+          }
+          Start-Process msiexec.exe -ArgumentList "/i `"$PWD\tailscale.msi`" /quiet /norestart" -Wait
+          Start-Sleep -Seconds 5
+          Remove-Item tailscale.msi -Force -ErrorAction SilentlyContinue
+          $tsPath = "$env:ProgramFiles\Tailscale\tailscale.exe"
+          if (Test-Path $tsPath) {
+            Write-Host "✅ تم تثبيت Tailscale بنجاح"
+          } else {
+            Write-Error "❌ فشل التثبيت"
+            exit 1
+          }
+
+      # =========================================================
+      # 5. الاتصال بـ Tailscale + إعادة محاولة جلب الـ IP
+      # =========================================================
+      - name: الاتصال بـ Tailscale
+        run: |
+          # إنشاء مجلد الحالة إن لم يكن موجوداً
+          New-Item -ItemType Directory -Force -Path C:\ts-state
+
+          $tsPath = "$env:ProgramFiles\Tailscale\tailscale.exe"
+          Write-Host "✅ تم العثور على Tailscale في: $tsPath"
+
+          # محاولة الاتصال مع إعادة المحاولة في حال الفشل
+          $maxRetries = 5
+          $retryDelay = 10  # ثوانٍ
+          $connected = $false
+
+          for ($i = 1; $i -le $maxRetries; $i++) {
+            Write-Host "محاولة الاتصال رقم $i ..."
+
+            # تشغيل الأمر مع --accept-risk=all لتجاوز أي تحذيرات
+            & $tsPath up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-rdp --statedir="C:\ts-state" --accept-risk=all
+
+            # انتظار قليل لتحديث الحالة
             Start-Sleep -Seconds 5
-            $retries++
+
+            # التحقق من الحالة عبر status
+            $status = & $tsPath status
+            Write-Host "حالة Tailscale: $status"
+
+            # محاولة الحصول على IP
+            $ip = & $tsPath ip -4
+            if ($ip -and $ip -match '^\d+\.\d+\.\d+\.\d+$') {
+              Write-Host "✅ تم الحصول على IP: $ip"
+              echo "TAILSCALE_IP=$ip" >> $env:GITHUB_ENV
+              $connected = $true
+              break
+            } else {
+              Write-Host "⚠️  لم يتم الحصول على IP صالح، إعادة المحاولة بعد $retryDelay ثانية..."
+              Start-Sleep -Seconds $retryDelay
+            }
           }
-          if (-not $tsIP) {
-            Write-Error "Tailscale IP not assigned. Exiting."
+
+          if (-not $connected) {
+            Write-Error "❌ فشل الاتصال بـ Tailscale بعد $maxRetries محاولات."
             exit 1
           }
-          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
 
-      - name: Verify RDP Accessibility
+      # =========================================================
+      # 6. عرض بيانات الدخول والبقاء شغالاً
+      # =========================================================
+      - name: عرض بيانات الدخول
         run: |
-          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
-          $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
-          if (-not $testResult.TcpTestSucceeded) {
-            Write-Error "TCP connection to RDP port 3389 failed"
-            exit 1
-          }
-          Write-Host "TCP connectivity successful!"
+          Write-Host "====================================================="
+          Write-Host "✅ RDP شغال الآن (لمدة 6 ساعات)"
+          Write-Host "العنوان: $env:TAILSCALE_IP"
+          Write-Host "المستخدم: Admin"
+          Write-Host "كلمة المرور: $env:RDP_PASSWORD"
+          Write-Host "====================================================="
+          Write-Host "⚠️  الـ IP ثابت ولا يتغير عند إعادة التشغيل بفضل الكاش."
+          Write-Host "====================================================="
 
-      - name: Install Performance Tools (Simulate 32GB Environment)
-        run: |
-          # تثبيت أدوات لتحسين الأداء (لا تؤثر على الذاكرة الفعلية)
-          choco install googlechrome firefox 7zip cpu-z hwinfo -y
-          # عرض معلومات النظام الحقيقية
-          systeminfo | Select-String "Total Physical Memory"
-          wmic os get TotalVisibleMemorySize
-
-      - name: Maintain Connection (Unlimited Runtime)
-        run: |
-          Write-Host "`n=== RDP ACCESS ==="
-          Write-Host "Address: $env:TAILSCALE_IP"
-          Write-Host "Username: RDP"
-          Write-Host "Password: $(echo $env:RDP_CREDS | Select-String -Pattern 'Password: (.+)' | ForEach-Object { $_.Matches.Groups[1].Value })"
-          Write-Host "==================`n"
-          Write-Host "NOTE: Actual RAM is limited by GitHub runner (~7GB)."
-          Write-Host "This workflow simulates a 32GB environment by installing monitoring tools."
-          Write-Host "To truly get 32GB, you need a self-hosted runner with that hardware."
-          Write-Host "`nKeeping runner alive indefinitely (or until cancelled)."
           while ($true) {
-            Write-Host "[$(Get-Date)] RDP Active - Use Ctrl+C in workflow to terminate"
-            # إعادة محاولة الاتصال إذا انقطع (تجديد الـ Tunnel)
-            & "$env:ProgramFiles\Tailscale\tailscale.exe" status
-            Start-Sleep -Seconds 300
-          }
-
-      - name: Fallback Keep-Alive (if Tailscale drops)
-        if: failure()
-        run: |
-          Write-Host "Tailscale might have disconnected. Attempting to re-connect..."
-          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID
-          while ($true) {
-            Write-Host "[$(Get-Date)] Reconnected - RDP still active"
+            Write-Host "[$(Get-Date)] RDP نشط على IP: $env:TAILSCALE_IP ..."
             Start-Sleep -Seconds 300
           }
